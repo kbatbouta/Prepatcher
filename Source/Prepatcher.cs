@@ -1,31 +1,32 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Reflection.Emit;
-using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Xml;
-using dnlib.DotNet;
 using HarmonyLib;
 using Ionic.Crc;
-using RimWorld;
-using RimWorld.Planet;
+using Microsoft.Reflection;
+using Mono.Cecil;
+using Mono.Cecil.Cil;
+using Mono.Cecil.Rocks;
 using UnityEngine;
 using Verse;
+using cecilOpCodes = Mono.Cecil.Cil.OpCodes;
+using cecilOpCode = Mono.Cecil.Cil.OpCode;
+using OpCodes = System.Reflection.Emit.OpCodes;
+using System.Collections;
 
 namespace Prepatcher
 {
-    public class NewFieldData
+    [StaticConstructorOnStartup]
+    static class PrepatcherStatic
     {
-        public string name;
-        public string ofType;
-        public string inType;
-        public bool isStatic;
+        static PrepatcherStatic()
+        {
+        }
     }
 
     public class PrepatcherMod : Mod
@@ -34,94 +35,91 @@ namespace Prepatcher
 
         static FieldInfo MonoAssemblyField = AccessTools.Field(typeof(Assembly), "_mono_assembly");
 
+        static Assembly origAsm;
         static Assembly newAsm;
-        static IntPtr newAsmPtr;
-        static IntPtr newAsmName;
 
         const string PrepatcherMarkerField = "PrepatcherMarker";
         const string AssemblyCSharp = "Assembly-CSharp.dll";
         const string AssemblyCSharpCached = "Assembly-CSharp_prepatched.dll";
         const string AssemblyCSharpCachedHash = "Assembly-CSharp_prepatched.hash";
 
-        public static string ManagedFolder = Native.OSSpecifics();
+        public static string ManagedFolder = Native.ManagedFolder();
 
         public PrepatcherMod(ModContentPack content) : base(content)
         {
-            int existingCrc = 0;
+            if (!DoLoad())
+                return;
 
-            if (File.Exists(DataPath(AssemblyCSharpCached)) && File.Exists(DataPath(AssemblyCSharpCachedHash)))
-                try
-                {
-                    existingCrc = int.Parse(File.ReadAllText(DataPath(AssemblyCSharpCachedHash), Encoding.UTF8));
-                }
-                catch { }
+            Info("Zzz...");
 
-
-            var assemblyCSharpBytes = File.ReadAllBytes(Path.Combine(Application.dataPath, ManagedFolder, AssemblyCSharp));
-            var fieldsToAdd = new List<NewFieldData>();
-            int fieldCrc = new CRC32().GetCrc32(new MemoryStream(assemblyCSharpBytes));
-
-            foreach (var mod in LoadedModManager.RunningModsListForReading)
+            try
             {
-                var assets = DirectXmlLoader.XmlAssetsInModFolder(mod, "Prepatches");
-                foreach (var ass in assets)
-                {
-                    if (ass.name == "Fields.xml")
-                    {
-                        foreach (var f in ass.xmlDoc["Fields"])
-                        {
-                            Log.Message($"Prepatcher XML: found new field {((XmlElement)f).Attributes["Name"].Value}");
-
-                            bool.TryParse(((XmlElement)f).Attributes["IsStatic"]?.Value?.ToLowerInvariant(), out bool isStatic);
-
-                            fieldsToAdd.Add(
-                                new NewFieldData()
-                                {
-                                    name = ((XmlElement)f).Attributes["Name"].Value,
-                                    ofType = ((XmlElement)f).Attributes["OfType"].Value,
-                                    inType = ((XmlElement)f).Attributes["InType"].Value,
-                                    isStatic = isStatic
-                                }
-                            );
-                        }
-
-                        fieldCrc = Gen.HashCombineInt(fieldCrc, new CRC32().GetCrc32(new MemoryStream(Encoding.UTF8.GetBytes(ass.xmlDoc.InnerXml))));
-                    }
-                }
+                Thread.Sleep(Timeout.Infinite);
+            } catch(ThreadAbortException)
+            {
+                Info("Aborting the loading thread. This is harmless.");
             }
+        }
 
-            Log.Message($"Prepatcher: {existingCrc} {fieldCrc} {AppDomain.CurrentDomain.ReflectionOnlyGetAssemblies().Length}");
+        static bool DoLoad()
+        {
+            int existingCrc = GetExistingCRC();
+            var assemblyCSharpBytes = File.ReadAllBytes(Path.Combine(Application.dataPath, ManagedFolder, AssemblyCSharp));
+
+            List<NewFieldData> fieldsToAdd = CollectFields(
+                new CRC32().GetCrc32(new MemoryStream(assemblyCSharpBytes)),
+                out int fieldCrc
+            );
+
+            Info($"CRCs: {existingCrc} {fieldCrc}, refonlys: {AppDomain.CurrentDomain.ReflectionOnlyGetAssemblies().Length}");
 
             if (AccessTools.Field(typeof(Game), PrepatcherMarkerField) != null)
-                return;
+            {
+                Info("Restarted with the patched assembly, going silent.");
+                return false;
+            }
 
             Native.EarlyInit();
 
-            var origAsm = typeof(Game).Assembly;
-
+            origAsm = typeof(Game).Assembly;
             SetReflectionOnly(origAsm, true);
 
             MemoryStream stream;
 
             if (existingCrc != fieldCrc)
             {
-                Log.Message("Prepatcher: baking a new assembly");
-                BakeAsm(assemblyCSharpBytes, fieldsToAdd, stream = new MemoryStream());
+                Info("Baking a new assembly");
+                stream = new MemoryStream();
+                BakeAsm(assemblyCSharpBytes, fieldsToAdd, stream);
                 File.WriteAllText(DataPath(AssemblyCSharpCachedHash), fieldCrc.ToString(), Encoding.UTF8);
             }
             else
             {
-                Log.Message("Prepatcher: CRC matches, loading cached");
+                Info("CRC matches, loading cached");
                 stream = new MemoryStream(File.ReadAllBytes(Path.Combine(Application.dataPath, ManagedFolder, AssemblyCSharpCached)));
             }
 
             newAsm = Assembly.Load(stream.ToArray());
-            newAsmPtr = (IntPtr)MonoAssemblyField.GetValue(newAsm);
-            newAsmName = Native.mono_assembly_get_name(newAsmPtr);
 
             SetReflectionOnly(origAsm, false);
 
-            Log.Message("Patching Start");
+            DoHarmonyPatches();
+
+            Info("Setting refonly");
+
+            SetAllRefOnly();
+
+            foreach (var mod in LoadedModManager.RunningModsListForReading)
+                mod.assemblies.ReloadAll();
+
+            doneLoading = true;
+
+            return true;
+        }
+
+        static void DoHarmonyPatches()
+        {
+            Info("Patching Start");
 
             harmony.Patch(
                 origAsm.GetType("Verse.Root_Play").GetMethod("Start"),
@@ -133,7 +131,12 @@ namespace Prepatcher
                 transpiler: new HarmonyMethod(typeof(PrepatcherMod), nameof(EmptyTranspiler))
             );
 
-            Log.Message("Patching Update");
+            harmony.Patch(
+                origAsm.GetType("Verse.Root").GetMethod("OnGUI"),
+                new HarmonyMethod(typeof(PrepatcherMod), nameof(RootOnGUIPrefix))
+            );
+
+            Info("Patching Update");
 
             harmony.Patch(
                 origAsm.GetType("Verse.Root_Play").GetMethod("Update"),
@@ -144,14 +147,10 @@ namespace Prepatcher
                 origAsm.GetType("Verse.Root_Entry").GetMethod("Update"),
                 new HarmonyMethod(typeof(PrepatcherMod), nameof(RootUpdatePrefix))
             );
+        }
 
-            harmony.Patch(
-                origAsm.GetType("Verse.Root").GetMethod("OnGUI"),
-                transpiler: new HarmonyMethod(typeof(PrepatcherMod), nameof(EmptyTranspiler))
-            );
-
-            Log.Message("Setting refonly");
-
+        static void SetAllRefOnly()
+        {
             SetReflectionOnly(origAsm, true);
 
             var asmResolve = AccessTools.Field(typeof(AppDomain), "AssemblyResolve");
@@ -178,53 +177,233 @@ namespace Prepatcher
             foreach (var mod in LoadedModManager.RunningModsListForReading)
                 foreach (var modAsm in mod.assemblies.loadedAssemblies)
                     SetReflectionOnly(modAsm, true);
-
-            foreach (var mod in LoadedModManager.RunningModsListForReading)
-                mod.assemblies.ReloadAll();
-
-            doneLoading = true;
-
-            Log.Message("Zzz...");
-
-            Thread.Sleep(Timeout.Infinite);
         }
 
-        static void BakeAsm(byte[] asmCSharp, List<NewFieldData> fieldsToAdd, Stream writeTo)
+        static int GetExistingCRC()
         {
-            using var dnOrigAsm = ModuleDefMD.Load(asmCSharp, new ModuleContext(new AssemblyResolver()));
+            if (!File.Exists(DataPath(AssemblyCSharpCached)) || !File.Exists(DataPath(AssemblyCSharpCachedHash)))
+                return 0;
 
-            var dnCrcField = new FieldDefUser(
-                PrepatcherMarkerField,
-                new FieldSig(dnOrigAsm.CorLibTypes.Int32),
-                dnlib.DotNet.FieldAttributes.Static
-            );
+            try { return int.Parse(File.ReadAllText(DataPath(AssemblyCSharpCachedHash), Encoding.UTF8)); }
+            catch { return 0; }
+        }
 
-            dnOrigAsm.Find("Verse.Game", true).Fields.Add(dnCrcField);
+        const string FieldsXmlFile = "Fields.xml";
+        const string PrepatchesFolder = "Prepatches";
 
-            foreach (var fieldToAdd in fieldsToAdd)
+        static List<NewFieldData> CollectFields(int inCrc, out int outCrc)
+        {
+            outCrc = inCrc;
+            var fieldsToAdd = new List<NewFieldData>();
+
+            foreach (var mod in LoadedModManager.RunningModsListForReading)
             {
-                var fieldType = GenTypes.GetTypeInAnyAssembly(fieldToAdd.ofType);
-                Log.Message($"Patching in a new field {fieldToAdd.name} of type {fieldType.ToStringSafe()}/{fieldToAdd.ofType} in type {fieldToAdd.inType}");
+                var assets = DirectXmlLoader.XmlAssetsInModFolder(mod, PrepatchesFolder);
+                foreach (var ass in assets)
+                {
+                    if (ass.name != FieldsXmlFile) continue;
 
-                var dnNewField = new FieldDefUser(
-                    fieldToAdd.name,
-                    new FieldSig(dnOrigAsm.ImportAsTypeSig(fieldType)),
-                    dnlib.DotNet.FieldAttributes.Public
-                );
+                    foreach (var e in ass.xmlDoc["Fields"].OfType<XmlElement>())
+                    {
+                        var parsed = ParseFieldData(e, out bool success);
 
-                if (fieldToAdd.isStatic)
-                    dnNewField.Attributes |= dnlib.DotNet.FieldAttributes.Static;
+                        if (success)
+                        {
+                            fieldsToAdd.Add(parsed);
+                            InfoXML($"{mod.Name}: Parsed {parsed}");
+                        }
+                        else
+                        {
+                            ErrorXML($"{mod.Name}: Error parsing {parsed}");
+                        }
+                    }
 
-                dnOrigAsm.Find(fieldToAdd.inType, true).Fields.Add(dnNewField);
+                    outCrc = Gen.HashCombineInt(outCrc, new CRC32().GetCrc32(new MemoryStream(Encoding.UTF8.GetBytes(ass.xmlDoc.InnerXml))));
+                }
             }
 
-            Log.Message("Added fields");
+            return fieldsToAdd;
+        }
 
-            var opts = new dnlib.DotNet.Writer.ModuleWriterOptions(dnOrigAsm);
-            opts.MetadataOptions.Flags |= dnlib.DotNet.Writer.MetadataFlags.PreserveAll;
+        const string NameAttr = "Name";
+        const string FieldTypeAttr = "FieldType";
+        const string TargetTypeAttr = "TargetType";
+        const string IsStaticAttr = "IsStatic";
+        const string DefaultValueAttr = "DefaultValue";
 
-            dnOrigAsm.Write(writeTo);
-            dnOrigAsm.Write(DataPath(AssemblyCSharpCached));
+        static NewFieldData ParseFieldData(XmlElement xml, out bool success)
+        {
+            success = true;
+
+            bool.TryParse(xml.Attributes[IsStaticAttr]?.Value?.ToLowerInvariant(), out bool isStatic);
+
+            var fieldType = xml.Attributes[FieldTypeAttr]?.Value;
+            Type fieldTypeType = null;
+            if (fieldType == null || (fieldTypeType = GenTypes.GetTypeInAnyAssembly(fieldType)) == null)
+                success = false;
+
+            var targetType = xml.Attributes[TargetTypeAttr]?.Value;
+            Type targetTypeType = null;
+            if (targetType == null || (targetTypeType = GenTypes.GetTypeInAnyAssembly(targetType)) == null)
+                success = false;
+
+            object defaultValue = null;
+            if (fieldTypeType != null)
+            {
+                var str = xml.Attributes[DefaultValueAttr]?.Value;
+                if (str == "new()" && fieldTypeType.GetConstructor(new Type[0]) != null)
+                    defaultValue = NewFieldData.DEFAULT_VALUE_NEW_CTOR;
+                else if (GetConstantOpCode(fieldTypeType) != null)
+                    defaultValue = ParseHelper.FromString(str, fieldTypeType);
+                else if (fieldTypeType.IsValueType)
+                    defaultValue = Activator.CreateInstance(fieldTypeType);
+            }
+
+            return new NewFieldData()
+            {
+                name = xml.Attributes[NameAttr]?.Value,
+                fieldType = fieldTypeType == null ? null : fieldType,
+                targetType = targetTypeType == null ? null : targetType,
+                isStatic = isStatic,
+                defaultValue = defaultValue
+            };
+        }
+
+        static void BakeAsm(byte[] sourceAsmBytes, List<NewFieldData> fieldsToAdd, MemoryStream writeTo)
+        {
+            using ModuleDefinition module = ModuleDefinition.ReadModule(new MemoryStream(sourceAsmBytes));
+
+            module.GetType("Verse.Game").Fields.Add(new FieldDefinition(
+                PrepatcherMarkerField,
+                Mono.Cecil.FieldAttributes.Static,
+                module.TypeSystem.Int32
+            ));
+
+            foreach (var newField in fieldsToAdd)
+                AddField(module, newField);
+
+            Info("Added fields");
+
+            module.Write(writeTo);
+            File.WriteAllBytes(DataPath(AssemblyCSharpCached), writeTo.ToArray());
+        }
+
+        static void AddField(ModuleDefinition module, NewFieldData newField)
+        {
+            var fieldType = GenTypes.GetTypeInAnyAssembly(newField.fieldType);
+            var ceFieldType = module.ImportReference(fieldType);
+
+            Info($"Patching in a new field {newField.name} of type {ceFieldType.ToStringSafe()}/{newField.fieldType} in type {newField.targetType}");
+
+            var ceField = new FieldDefinition(
+                newField.name,
+                Mono.Cecil.FieldAttributes.Public,
+                ceFieldType
+            );
+
+            if (newField.isStatic)
+                ceField.Attributes |= Mono.Cecil.FieldAttributes.Static;
+
+            var targetType = module.GetType(newField.targetType);
+            targetType.Fields.Add(ceField);
+
+            if (!IsNull(newField.defaultValue))
+                WriteFieldInitializers(newField, ceField, ceFieldType, fieldType);
+        }
+
+        static void WriteFieldInitializers(NewFieldData newField, FieldDefinition dnNewField, TypeReference ceFieldType, Type fieldType)
+        {
+            var targetType = dnNewField.DeclaringType;
+            var i = targetType.Fields.IndexOf(dnNewField);
+
+            foreach (var ctor in targetType.GetConstructors().Where(c => !c.IsStatic))
+            {
+                if (CallsAThisCtor(ctor)) continue;
+
+                var insts = ctor.Body.Instructions;
+                int insertAt = -1;
+                int lastValid = -1;
+
+                for (int k = 0; k < insts.Count; k++)
+                {
+                    var inst = insts[k];
+                    insertAt = lastValid;
+
+                    if (inst.OpCode == cecilOpCodes.Call && inst.Operand is MethodDefinition m && m.IsConstructor)
+                        break;
+
+                    if (inst.OpCode == cecilOpCodes.Stfld && inst.Operand is FieldDefinition f)
+                    {
+                        if (targetType.Fields.IndexOf(f) > i)
+                            break;
+
+                        lastValid = k;
+                    }
+                }
+
+                insertAt++;
+
+                var ilProc = ctor.Body.GetILProcessor();
+                var insertBefore = insts[insertAt];
+
+                if (!newField.isStatic)
+                    ilProc.InsertBefore(insertBefore, Instruction.Create(cecilOpCodes.Ldarg_0));
+
+                if (newField.defaultValue == NewFieldData.DEFAULT_VALUE_NEW_CTOR)
+                {
+                    ilProc.InsertBefore(insertBefore, Instruction.Create(cecilOpCodes.Newobj, targetType.Module.ImportReference(fieldType.GetConstructor(new Type[0]))));
+                }
+                else
+                {
+                    var defaultValueInst = Instruction.Create(cecilOpCodes.Ret);
+                    defaultValueInst.OpCode = GetConstantOpCode(newField.defaultValue).Value;
+                    defaultValueInst.Operand = newField.defaultValue;
+
+                    ilProc.InsertBefore(insertBefore, defaultValueInst); 
+                }
+
+                ilProc.InsertBefore(insertBefore, Instruction.Create(newField.isStatic ? cecilOpCodes.Stsfld : cecilOpCodes.Stfld, dnNewField));
+            }
+        }
+
+        static bool CallsAThisCtor(MethodDefinition method)
+        {
+            foreach (var inst in method.Body.Instructions)
+                if (inst.OpCode == cecilOpCodes.Call && inst.Operand is MethodDefinition m && m.IsConstructor && m.DeclaringType == method.DeclaringType)
+                    return true;
+            return false;
+        }
+
+        static bool IsNull(object val)
+        {
+            return val == null || (val.GetType().IsValueType && val == Activator.CreateInstance(val.GetType()));
+        }
+
+        static cecilOpCode? GetConstantOpCode(object c)
+        {
+            return GetConstantOpCode(c.GetType());
+        }
+
+        static cecilOpCode? GetConstantOpCode(Type t)
+        {
+            var code = t.GetTypeCode();
+
+            if (code >= TypeCode.Boolean && code <= TypeCode.UInt32)
+                return cecilOpCodes.Ldc_I4;
+
+            if (code >= TypeCode.Int64 && code <= TypeCode.UInt64)
+                return cecilOpCodes.Ldc_I8;
+
+            if (code == TypeCode.Single)
+                return cecilOpCodes.Ldc_R4;
+
+            if (code == TypeCode.Double)
+                return cecilOpCodes.Ldc_R8;
+
+            if (code == TypeCode.String)
+                return cecilOpCodes.Ldstr;
+
+            return null;
         }
 
         static string DataPath(string file)
@@ -232,20 +411,36 @@ namespace Prepatcher
             return Path.Combine(Application.dataPath, ManagedFolder, file);
         }
 
-        static bool inited;
         static bool doneLoading;
+        static bool runOnce;
 
-        static bool RootUpdatePrefix()
+        static bool RootUpdatePrefix(Root __instance)
         {
-            if (!inited)
-            {
-                //Native.mono_install_assembly_search_hook(Marshal.GetFunctionPointerForDelegate((Func<IntPtr, IntPtr, IntPtr>)AssemblySearch), IntPtr.Zero);
-                inited = true;
-            }
-
             while (!doneLoading)
                 Thread.Sleep(50);
 
+            if (!runOnce)
+            {
+                // Done to prevent a brief flash of black
+                __instance.StartCoroutine(RecreateAtEndOfFrame());
+                runOnce = true;
+            }
+            else
+            {
+                RecreateComponents();
+            }
+
+            return false;
+        }
+
+        static IEnumerator RecreateAtEndOfFrame()
+        {
+            yield return new WaitForEndOfFrame();
+            RecreateComponents();
+        }
+
+        static void RecreateComponents()
+        {
             // It's important the components are iterated this way to make sure
             // they are recreated in the correct order.
             foreach (var comp in UnityEngine.Object.FindObjectsOfType<Component>())
@@ -255,8 +450,6 @@ namespace Prepatcher
                 comp.gameObject.AddComponent(translation);
                 UnityEngine.Object.Destroy(comp);
             }
-
-            return false;
         }
 
         static IEnumerable<CodeInstruction> EmptyTranspiler(IEnumerable<CodeInstruction> insts)
@@ -264,31 +457,9 @@ namespace Prepatcher
             yield return new CodeInstruction(OpCodes.Ret);
         }
 
-        static IntPtr AssemblySearch(IntPtr aname, IntPtr data)
+        static bool RootOnGUIPrefix()
         {
-            if (StrsEqual(Native.mono_assembly_name_get_name(newAsmName), Native.mono_assembly_name_get_name(aname)))
-                return newAsmPtr;
-
-            return IntPtr.Zero;
-        }
-
-        unsafe static bool StrsEqual(IntPtr a, IntPtr b)
-        {
-            if (a == IntPtr.Zero || b == IntPtr.Zero)
-                return a == b;
-
-            byte* aa = (byte*)a;
-            byte* bb = (byte*)b;
-
-            while (*aa != 0 && *bb != 0)
-            {
-                if (*aa != *bb)
-                    return false;
-                aa++;
-                bb++;
-            }
-
-            return *aa == *bb;
+            return true;
         }
 
         // Loading two assemblies with the same name and version isn't possible with Unity's Mono.
@@ -301,6 +472,35 @@ namespace Prepatcher
         public unsafe static void SetReflectionOnly(Assembly asm, bool value)
         {
             *(int*)((long)(IntPtr)MonoAssemblyField.GetValue(asm) + 0x74) = value ? 1 : 0;
+        }
+
+        static void Info(string msg) => Log.Message($"Prepatcher: {msg}");
+        static void InfoXML(string msg) => Log.Message($"Prepatcher XML: {msg}");
+        static void ErrorXML(string msg) => Log.Error($"Prepatcher XML: {msg}");
+    }
+
+    public class NewFieldData
+    {
+        public static readonly object DEFAULT_VALUE_NEW_CTOR = new object();
+
+        public string name;
+        public string fieldType;
+        public string targetType;
+        public bool isStatic;
+        public object defaultValue; // This is default(fieldType), not null for value types
+
+        public override string ToString()
+        {
+            return $"public{(isStatic ? " static" : "")} {fieldType.ToStringSafe()} {targetType.ToStringSafe()}:{name.ToStringSafe()} = {(defaultValue == DEFAULT_VALUE_NEW_CTOR ? "new()" : defaultValue.ToStringSafe())};";
+        }
+    }
+
+    public static class Extensions
+    {
+        public static void Insert<T>(this IList<T> list, int index, params T[] items)
+        {
+            foreach (T item in items)
+                list.Insert(index++, item);
         }
     }
 }
