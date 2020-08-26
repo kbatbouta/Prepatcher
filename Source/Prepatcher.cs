@@ -8,7 +8,6 @@ using System.Threading;
 using System.Xml;
 using HarmonyLib;
 using Ionic.Crc;
-using Microsoft.Reflection;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 using Mono.Cecil.Rocks;
@@ -18,6 +17,11 @@ using cecilOpCodes = Mono.Cecil.Cil.OpCodes;
 using cecilOpCode = Mono.Cecil.Cil.OpCode;
 using OpCodes = System.Reflection.Emit.OpCodes;
 using System.Collections;
+using System.Runtime.InteropServices;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+using RimWorld;
+using System.Numerics;
 
 namespace Prepatcher
 {
@@ -43,7 +47,7 @@ namespace Prepatcher
         const string AssemblyCSharpCached = "Assembly-CSharp_prepatched.dll";
         const string AssemblyCSharpCachedHash = "Assembly-CSharp_prepatched.hash";
 
-        public static string ManagedFolder = Native.ManagedFolder();
+        public static string ManagedFolder = ManagedFolderOS();
 
         public PrepatcherMod(ModContentPack content) : base(content)
         {
@@ -75,11 +79,16 @@ namespace Prepatcher
 
             if (AccessTools.Field(typeof(Game), PrepatcherMarkerField) != null)
             {
-                Info("Restarted with the patched assembly, going silent.");
+                // Actually assign the enum values
+                foreach (var f in fieldsToAdd.Where(f => f.isEnum))
+                {
+                    var targetType = GenTypes.GetTypeInAnyAssembly(f.targetType);
+                    targetType.GetField(f.name).SetValue(null, f.defaultValue);
+                }
+
+                Info($"Restarted with the patched assembly, going silent.");
                 return false;
             }
-
-            Native.EarlyInit();
 
             origAsm = typeof(Game).Assembly;
             SetReflectionOnly(origAsm, true);
@@ -176,7 +185,8 @@ namespace Prepatcher
 
             foreach (var mod in LoadedModManager.RunningModsListForReading)
                 foreach (var modAsm in mod.assemblies.loadedAssemblies)
-                    SetReflectionOnly(modAsm, true);
+                    if (!modAsm.GetName().Name.StartsWith("UnityEngine")) // Some mods include Unity's dlls, this is bad
+                        SetReflectionOnly(modAsm, true);
         }
 
         static int GetExistingCRC()
@@ -206,57 +216,124 @@ namespace Prepatcher
                     foreach (var e in ass.xmlDoc["Fields"].OfType<XmlElement>())
                     {
                         var parsed = ParseFieldData(e, out bool success);
+                        parsed.ownerMod = mod.Name;
 
                         if (success)
-                        {
                             fieldsToAdd.Add(parsed);
-                            InfoXML($"{mod.Name}: Parsed {parsed}");
-                        }
                         else
-                        {
                             ErrorXML($"{mod.Name}: Error parsing {parsed}");
-                        }
                     }
 
                     outCrc = Gen.HashCombineInt(outCrc, new CRC32().GetCrc32(new MemoryStream(Encoding.UTF8.GetBytes(ass.xmlDoc.InnerXml))));
                 }
             }
 
+            foreach (var fieldsPerType in fieldsToAdd.Where(f => f.isEnum).GroupBy(f => f.targetType))
+            {
+                var targetType = GenTypes.GetTypeInAnyAssembly(fieldsPerType.Key);
+                var enumType = Enum.GetUnderlyingType(targetType);
+                var max = ToUInt64(enumType.GetField("MaxValue").GetRawConstantValue());
+                var taken = AccessTools.GetDeclaredFields(targetType).Where(f => f.IsLiteral).Select(f => ToUInt64(f.GetRawConstantValue())).ToHashSet();
+
+                foreach (var f in fieldsPerType)
+                {
+                    var free = FindNotTaken(f.enumPreferred, max, taken);
+                    if (free == null)
+                    {
+                        ErrorXML($"{f.ownerMod}: Couldn't assign a value for {f}");
+                        fieldsToAdd.Remove(f);
+                        continue;
+                    }
+
+                    f.defaultValue = FromUInt64(free.Value, enumType);
+                    taken.Add(free.Value);
+                }
+            }
+
+            foreach (var f in fieldsToAdd)
+                InfoXML($"{f.ownerMod}: Parsed {f}");
+
             return fieldsToAdd;
         }
 
+        static ulong ToUInt64(object obj)
+        {
+            if (obj is ulong u)
+                return u;
+            return (ulong)Convert.ToInt64(obj);
+        }
+
+        static object FromUInt64(ulong from, Type to) => Type.GetTypeCode(to) switch
+        {
+            TypeCode.Byte => (byte)from,
+            TypeCode.SByte => (sbyte)from,
+            TypeCode.Int16 => (short)from,
+            TypeCode.UInt16 => (ushort)from,
+            TypeCode.Int32 => (int)from,
+            TypeCode.UInt32 => (uint)from,
+            TypeCode.Int64 => (long)from,
+            TypeCode.UInt64 => from,
+            _ => null
+        };
+
+        static ulong? FindNotTaken(ulong start, ulong max, HashSet<ulong> taken)
+        {
+            // TODO maybe wrap around?
+            for (ulong i = start; i <= max; i++)
+            {
+                if (taken.Contains(i)) continue;
+                return i;
+            }
+
+            return null;
+        }
+
+        const string EnumElement = "Enum";
         const string NameAttr = "Name";
         const string FieldTypeAttr = "FieldType";
         const string TargetTypeAttr = "TargetType";
         const string IsStaticAttr = "IsStatic";
         const string DefaultValueAttr = "DefaultValue";
+        const string PreferredValueAttr = "PreferredValue";
 
         static NewFieldData ParseFieldData(XmlElement xml, out bool success)
         {
             success = true;
 
+            var isEnum = xml.Name == EnumElement;
             bool.TryParse(xml.Attributes[IsStaticAttr]?.Value?.ToLowerInvariant(), out bool isStatic);
-
-            var fieldType = xml.Attributes[FieldTypeAttr]?.Value;
-            Type fieldTypeType = null;
-            if (fieldType == null || (fieldTypeType = GenTypes.GetTypeInAnyAssembly(fieldType)) == null)
-                success = false;
 
             var targetType = xml.Attributes[TargetTypeAttr]?.Value;
             Type targetTypeType = null;
             if (targetType == null || (targetTypeType = GenTypes.GetTypeInAnyAssembly(targetType)) == null)
                 success = false;
 
+            var fieldType = isEnum ? targetType : xml.Attributes[FieldTypeAttr]?.Value;
+            Type fieldTypeType = null;
+            if (fieldType == null || (fieldTypeType = GenTypes.GetTypeInAnyAssembly(fieldType)) == null)
+                success = false;
+
             object defaultValue = null;
-            if (fieldTypeType != null)
+            var defaultValueStr = xml.Attributes[DefaultValueAttr]?.Value;
+
+            if (fieldTypeType != null && defaultValueStr != null)
             {
-                var str = xml.Attributes[DefaultValueAttr]?.Value;
-                if (str == "new()" && fieldTypeType.GetConstructor(new Type[0]) != null)
+                if (defaultValueStr == "new()" && fieldTypeType.GetConstructor(new Type[0]) != null)
                     defaultValue = NewFieldData.DEFAULT_VALUE_NEW_CTOR;
                 else if (GetConstantOpCode(fieldTypeType) != null)
-                    defaultValue = ParseHelper.FromString(str, fieldTypeType);
-                else if (fieldTypeType.IsValueType)
-                    defaultValue = Activator.CreateInstance(fieldTypeType);
+                    defaultValue = ParseHelper.FromString(defaultValueStr, fieldTypeType);
+                else
+                    success = false;
+            }
+
+            ulong preferredValue = 1;
+            var preferredValueStr = xml.Attributes[PreferredValueAttr]?.Value;
+            if (preferredValueStr != null)
+            {
+                preferredValue = 
+                    (ulong?)new UInt64Converter().TryConvert(preferredValueStr) ??
+                    (ulong?)(long?)new Int64Converter().TryConvert(preferredValueStr) ??
+                    1;
             }
 
             return new NewFieldData()
@@ -264,8 +341,10 @@ namespace Prepatcher
                 name = xml.Attributes[NameAttr]?.Value,
                 fieldType = fieldTypeType == null ? null : fieldType,
                 targetType = targetTypeType == null ? null : targetType,
-                isStatic = isStatic,
-                defaultValue = defaultValue
+                isStatic = isStatic | isEnum,
+                defaultValue = defaultValue,
+                isEnum = isEnum,
+                enumPreferred = preferredValue
             };
         }
 
@@ -301,22 +380,28 @@ namespace Prepatcher
                 ceFieldType
             );
 
+            if (newField.isEnum)
+            {
+                ceField.Attributes |= Mono.Cecil.FieldAttributes.InitOnly | Mono.Cecil.FieldAttributes.HasDefault;
+                ceField.Constant = newField.defaultValue;
+            }
+
             if (newField.isStatic)
                 ceField.Attributes |= Mono.Cecil.FieldAttributes.Static;
 
             var targetType = module.GetType(newField.targetType);
             targetType.Fields.Add(ceField);
 
-            if (!IsNull(newField.defaultValue))
-                WriteFieldInitializers(newField, ceField, ceFieldType, fieldType);
+            if (newField.defaultValue != null)
+                WriteFieldInitializers(newField, ceField, fieldType);
         }
 
-        static void WriteFieldInitializers(NewFieldData newField, FieldDefinition dnNewField, TypeReference ceFieldType, Type fieldType)
+        static void WriteFieldInitializers(NewFieldData newField, FieldDefinition ceNewField, Type fieldType)
         {
-            var targetType = dnNewField.DeclaringType;
-            var i = targetType.Fields.IndexOf(dnNewField);
+            var targetType = ceNewField.DeclaringType;
+            var i = targetType.Fields.IndexOf(ceNewField);
 
-            foreach (var ctor in targetType.GetConstructors().Where(c => !c.IsStatic))
+            foreach (var ctor in targetType.GetConstructors().Where(c => c.IsStatic == newField.isStatic))
             {
                 if (CallsAThisCtor(ctor)) continue;
 
@@ -356,13 +441,14 @@ namespace Prepatcher
                 else
                 {
                     var defaultValueInst = Instruction.Create(cecilOpCodes.Ret);
-                    defaultValueInst.OpCode = GetConstantOpCode(newField.defaultValue).Value;
-                    defaultValueInst.Operand = newField.defaultValue;
+                    var op = GetConstantOpCode(newField.defaultValue).Value;
+                    defaultValueInst.OpCode = op;
+                    defaultValueInst.Operand = op == cecilOpCodes.Ldc_I4 ? Convert.ToInt32(newField.defaultValue) : newField.defaultValue;
 
                     ilProc.InsertBefore(insertBefore, defaultValueInst); 
                 }
 
-                ilProc.InsertBefore(insertBefore, Instruction.Create(newField.isStatic ? cecilOpCodes.Stsfld : cecilOpCodes.Stfld, dnNewField));
+                ilProc.InsertBefore(insertBefore, Instruction.Create(newField.isStatic ? cecilOpCodes.Stsfld : cecilOpCodes.Stfld, ceNewField));
             }
         }
 
@@ -374,11 +460,6 @@ namespace Prepatcher
             return false;
         }
 
-        static bool IsNull(object val)
-        {
-            return val == null || (val.GetType().IsValueType && val == Activator.CreateInstance(val.GetType()));
-        }
-
         static cecilOpCode? GetConstantOpCode(object c)
         {
             return GetConstantOpCode(c.GetType());
@@ -386,7 +467,7 @@ namespace Prepatcher
 
         static cecilOpCode? GetConstantOpCode(Type t)
         {
-            var code = t.GetTypeCode();
+            var code = Type.GetTypeCode(t);
 
             if (code >= TypeCode.Boolean && code <= TypeCode.UInt32)
                 return cecilOpCodes.Ldc_I4;
@@ -443,7 +524,7 @@ namespace Prepatcher
         {
             // It's important the components are iterated this way to make sure
             // they are recreated in the correct order.
-            foreach (var comp in UnityEngine.Object.FindObjectsOfType<Component>())
+            foreach (var comp in UnityEngine.Object.FindObjectsOfType<UnityEngine.Component>())
             {
                 var translation = newAsm.GetType(comp.GetType().FullName);
                 if (translation == null) continue;
@@ -477,21 +558,43 @@ namespace Prepatcher
         static void Info(string msg) => Log.Message($"Prepatcher: {msg}");
         static void InfoXML(string msg) => Log.Message($"Prepatcher XML: {msg}");
         static void ErrorXML(string msg) => Log.Error($"Prepatcher XML: {msg}");
+
+        static string ManagedFolderOS()
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+                return "Resources/Data/Managed";
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                return "Managed";
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+                return "Managed";
+            return null;
+        }
     }
 
     public class NewFieldData
     {
         public static readonly object DEFAULT_VALUE_NEW_CTOR = new object();
 
+        public string ownerMod;
         public string name;
         public string fieldType;
         public string targetType;
         public bool isStatic;
-        public object defaultValue; // This is default(fieldType), not null for value types
+        public object defaultValue;
+        public bool isEnum;
+        public ulong enumPreferred;
 
         public override string ToString()
         {
-            return $"public{(isStatic ? " static" : "")} {fieldType.ToStringSafe()} {targetType.ToStringSafe()}:{name.ToStringSafe()} = {(defaultValue == DEFAULT_VALUE_NEW_CTOR ? "new()" : defaultValue.ToStringSafe())};";
+            string modStr = isEnum ? "enum" : $"public{(isStatic ? " static" : "")}";
+            return $"{modStr} {fieldType.ToStringSafe()} {targetType.ToStringSafe()}:{name.ToStringSafe()}{DefaultValueStr()};";
+        }
+
+        private string DefaultValueStr()
+        {
+            if (defaultValue == null)
+                return "";
+            return $" = {(defaultValue == DEFAULT_VALUE_NEW_CTOR ? "new ()" : defaultValue.ToStringSafe())}";
         }
     }
 
@@ -501,6 +604,18 @@ namespace Prepatcher
         {
             foreach (T item in items)
                 list.Insert(index++, item);
+        }
+
+        public static object TryConvert(this TypeConverter converter, string s)
+        {
+            try
+            {
+                return converter.ConvertFromInvariantString(s);
+            }
+            catch
+            {
+                return null;
+            }
         }
     }
 }
